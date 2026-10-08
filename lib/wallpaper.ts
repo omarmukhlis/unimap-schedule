@@ -4,19 +4,46 @@ import { TYPE_LABEL } from "./schedule";
 export const WALLPAPER_FONT =
   'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
 
-/** Fraction of the height kept clear at the top for the lock screen clock. */
-export const SAFE_TOP_RATIO = 0.18;
+/**
+ * Reserved bands. Phones cover roughly the top third with the clock and
+ * widgets, and the bottom tenth with the home indicator and page dots.
+ */
+export const SAFE_SIDE_RATIO = 0.07;
+export const SAFE_TOP_RATIO = 0.3;
+export const SAFE_BOTTOM_RATIO = 0.1;
 
 export const MIN_DIMENSION = 480;
-export const MAX_DIMENSION = 4000;
+/**
+ * A generous per-axis backstop. The area cap below is what actually protects the
+ * browser, so this only catches absurd one-sided input like 100000 x 480.
+ */
+export const MAX_DIMENSION = 8000;
 
+/**
+ * iOS Safari refuses to allocate a canvas above roughly 16 megapixels and
+ * silently hands back a blank image, so total area is capped rather than
+ * trusting either axis on its own.
+ */
+export const MAX_CANVAS_AREA = 16_000_000;
+
+export interface CanvasSize {
+  width: number;
+  height: number;
+}
+
+/** Manual size overrides. The default canvas is derived from the screen instead. */
 export const WALLPAPER_PRESETS = [
-  { id: "iphone-1170", label: "iPhone 12/13/14", width: 1170, height: 2532 },
-  { id: "iphone-1290", label: "iPhone Pro Max", width: 1290, height: 2796 },
-  { id: "android-1080", label: "Android biasa", width: 1080, height: 2400 },
+  { id: "p1170-2532", label: "1170 × 2532", width: 1170, height: 2532 },
+  { id: "p1290-2796", label: "1290 × 2796", width: 1290, height: 2796 },
+  { id: "p1320-2868", label: "1320 × 2868", width: 1320, height: 2868 },
+  { id: "p1080-2400", label: "1080 × 2400", width: 1080, height: 2400 },
+  { id: "p1440-3120", label: "1440 × 3120", width: 1440, height: 3120 },
+  { id: "p750-1334", label: "750 × 1334", width: 750, height: 1334 },
 ] as const;
 
 export type PresetId = (typeof WALLPAPER_PRESETS)[number]["id"];
+
+export type SizeMode = "screen" | "manual";
 
 export const PALETTE_IDS = ["ocean", "forest", "ember", "graphite"] as const;
 export type PaletteId = (typeof PALETTE_IDS)[number];
@@ -24,6 +51,8 @@ export type PaletteId = (typeof PALETTE_IDS)[number];
 export type WallpaperTheme = "light" | "dark";
 
 export interface WallpaperOptions {
+  /** `screen` tracks the device; `manual` pins the width and height below. */
+  sizeMode: SizeMode;
   width: number;
   height: number;
   theme: WallpaperTheme;
@@ -141,6 +170,7 @@ export function getTones(options: WallpaperOptions): PaletteTones {
 }
 
 export const DEFAULT_WALLPAPER_OPTIONS: WallpaperOptions = {
+  sizeMode: "screen",
   width: WALLPAPER_PRESETS[0].width,
   height: WALLPAPER_PRESETS[0].height,
   theme: "light",
@@ -149,13 +179,94 @@ export const DEFAULT_WALLPAPER_OPTIONS: WallpaperOptions = {
   showVenue: true,
 };
 
-/** Keeps custom sizes inside a range that will not melt the browser. */
+/** Keeps a custom size inside a range that will not melt the browser. */
 export function clampDimension(value: number): number {
   if (Number.isNaN(value)) return MIN_DIMENSION;
   return Math.round(Math.min(MAX_DIMENSION, Math.max(MIN_DIMENSION, value)));
 }
 
+/**
+ * Scales both axes by one factor until the size fits the area cap, so the
+ * wallpaper keeps the aspect ratio of the screen it was measured from. Returns
+ * the size unchanged when it already fits, including for non-finite input,
+ * which `clampDimension` has already pinned to the minimum.
+ */
+export function clampCanvasSize(width: number, height: number): CanvasSize {
+  const w = clampDimension(width);
+  const h = clampDimension(height);
+
+  const area = w * h;
+  if (area <= MAX_CANVAS_AREA) return { width: w, height: h };
+
+  const scale = Math.sqrt(MAX_CANVAS_AREA / area);
+  return { width: clampDimension(w * scale), height: clampDimension(h * scale) };
+}
+
+/**
+ * Default canvas: the device screen in CSS pixels times the device pixel
+ * ratio, so the PNG lands on a 1:1 pixel grid. Always portrait, because
+ * landscape lock screens do not exist.
+ */
+export function screenCanvasSize(
+  screenWidth: number,
+  screenHeight: number,
+  dpr: number,
+): CanvasSize {
+  const ratio = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+  const shortSide = Math.min(screenWidth, screenHeight);
+  const longSide = Math.max(screenWidth, screenHeight);
+
+  const raw = { width: shortSide * ratio, height: longSide * ratio };
+  const clamped = clampCanvasSize(raw.width, raw.height);
+
+  // A very large dpr can leave the pair under the minimum after scaling.
+  if (clamped.width < MIN_DIMENSION || clamped.height < MIN_DIMENSION) {
+    return { width: MIN_DIMENSION, height: MIN_DIMENSION };
+  }
+  return clamped;
+}
+
+/** Reads the current screen, falling back to a common phone size when unknown. */
+export function currentScreenCanvasSize(): CanvasSize {
+  if (typeof screen === "undefined") {
+    return clampCanvasSize(WALLPAPER_PRESETS[0].width, WALLPAPER_PRESETS[0].height);
+  }
+  return screenCanvasSize(
+    screen.width || MIN_DIMENSION,
+    screen.height || MIN_DIMENSION,
+    typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
+  );
+}
+
+/** The one place that turns stored options into a size to actually draw. */
+export function resolveCanvasSize(options: WallpaperOptions): CanvasSize {
+  return options.sizeMode === "manual"
+    ? clampCanvasSize(options.width, options.height)
+    : currentScreenCanvasSize();
+}
+
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export type Measure = (text: string, size: number, weight: number) => number;
+
+/** Reserved bands for a given canvas, in absolute pixels. */
+export function safeArea(width: number, height: number): Rect {
+  const sideX = Math.round(width * SAFE_SIDE_RATIO);
+  const topY = Math.round(height * SAFE_TOP_RATIO);
+  const bottomY = Math.round(height * SAFE_BOTTOM_RATIO);
+
+  return {
+    x: sideX,
+    y: topY,
+    width: Math.max(1, width - sideX * 2),
+    height: Math.max(1, height - topY - bottomY),
+  };
+}
 
 export interface TextRun {
   text: string;
@@ -182,6 +293,8 @@ export interface WallpaperLayout {
   height: number;
   theme: WallpaperTheme;
   tones: PaletteTones;
+  /** The only region content is allowed to occupy. */
+  safe: Rect;
   header: TextRun[];
   rule: { x: number; y: number; width: number; color: string };
   rows: RowLayout[];
@@ -257,17 +370,19 @@ function sessionMeta(session: Session): string {
 /** Pure layout: turns sessions plus options into positioned, already-wrapped text. */
 export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
   const { sessions, options, measure } = input;
-  const width = clampDimension(options.width);
-  const height = clampDimension(options.height);
+  const { width, height } = resolveCanvasSize(options);
   const tones = getTones(options);
+  const safe = safeArea(width, height);
+  const padding = safe.x;
+  const contentWidth = safe.width;
 
-  const padding = Math.round(width * 0.075);
-  const safeTop = Math.round(height * SAFE_TOP_RATIO);
-  const headerSize = Math.round(width * 0.072);
-  const subSize = Math.round(width * 0.034);
-  const footerSize = Math.round(width * 0.026);
+  // Every size below is a fraction of the canvas, so the same code holds up
+  // for a 750x1334 phone and a 1440x3120 one.
+  const headerSize = Math.max(14, Math.round(width * 0.072));
+  const subSize = Math.max(10, Math.round(width * 0.034));
+  const footerSize = Math.max(9, Math.round(width * 0.026));
 
-  let cursorY = safeTop + Math.round(height * 0.014);
+  let cursorY = safe.y + Math.round(safe.height * 0.035);
   const header: TextRun[] = [];
   const pushHeader = (text: string, size: number, weight: number, color: string) => {
     if (!text) return;
@@ -276,20 +391,24 @@ export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
   };
 
   const dayLine = `${input.dayLabel} · ${input.dateLabel}`.trim();
-  for (const line of fit(dayLine.toUpperCase(), width - padding * 2, headerSize, 700, measure, 1)) {
+  for (const line of fit(dayLine.toUpperCase(), contentWidth, headerSize, 700, measure, 1)) {
     pushHeader(line, headerSize, 700, tones.accent);
   }
-  for (const line of fit(input.title, width - padding * 2, subSize * 1.18, 600, measure, 2)) {
+  for (const line of fit(input.title, contentWidth, subSize * 1.18, 600, measure, 2)) {
     pushHeader(line, Math.round(subSize * 1.18), 600, tones.text);
   }
-  for (const line of fit(input.subtitle, width - padding * 2, subSize, 400, measure, 1)) {
+  for (const line of fit(input.subtitle, contentWidth, subSize, 400, measure, 1)) {
     pushHeader(line, subSize, 400, tones.muted);
   }
 
-  const rule = { x: padding, y: cursorY + Math.round(height * 0.006), width: width - padding * 2, color: tones.accent };
-  const contentTop = rule.y + Math.round(height * 0.022);
-  const footerY = height - padding;
-  const contentBottom = footerY - footerSize * 2;
+  const rule = { x: padding, y: cursorY + Math.round(safe.height * 0.012), width: contentWidth, color: tones.accent };
+  const contentTop = rule.y + Math.round(safe.height * 0.038);
+
+  // The footer sits on the baseline of the reserved band, not on the canvas,
+  // so it can never slide under the home indicator.
+  const safeBottom = safe.y + safe.height;
+  const footerY = safeBottom - footerSize * 0.5;
+  const contentBottom = footerY - footerSize * 1.6;
 
   const rows: RowLayout[] = [];
   const gap = Math.max(4, Math.round(width * 0.014));
@@ -297,10 +416,10 @@ export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
 
   if (count > 0) {
     const available = Math.max(1, contentBottom - contentTop);
-    const idealRow = Math.round(width * 0.3);
+    const idealRow = Math.round(safe.height * 0.16);
     const needed = count * idealRow + (count - 1) * gap;
     const scale = Math.min(1, available / needed);
-    const minRow = Math.round(width * 0.16);
+    const minRow = Math.round(safe.height * 0.085);
 
     let rowHeight = Math.max(minRow, Math.floor(idealRow * scale));
     if (count * rowHeight + (count - 1) * gap > available) {
@@ -310,10 +429,10 @@ export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
     const timeSize = Math.max(10, Math.round(width * 0.03 * scale));
     const nameSize = Math.max(12, Math.round(width * 0.04 * scale));
     const metaSize = Math.max(9, Math.round(width * 0.028 * scale));
-    const timeColumn = Math.round(width * 0.27);
+    const timeColumn = Math.round(contentWidth * 0.3);
     const gutter = Math.round(width * 0.028);
     const textX = padding + timeColumn + gutter;
-    const textWidth = Math.max(40, width - textX - padding);
+    const textWidth = Math.max(40, padding + contentWidth - textX);
     const nameLineHeight = nameSize * 1.18;
     const metaLineHeight = metaSize * 1.42;
 
@@ -380,7 +499,7 @@ export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
         surface: {
           x: padding,
           y: top,
-          width: width - padding * 2,
+          width: contentWidth,
           height: rowHeight,
           radius: Math.round(width * 0.035),
           color: tones.surface,
@@ -402,11 +521,11 @@ export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
 
   const empty: TextRun[] = [];
   if (count === 0) {
-    const size = Math.round(width * 0.05);
+    const size = Math.max(12, Math.round(width * 0.05));
     const y = contentTop + (contentBottom - contentTop) / 2;
     empty.push({
       text: "Tiada kelas",
-      x: width / 2,
+      x: padding + contentWidth / 2,
       y,
       size,
       weight: 700,
@@ -427,7 +546,7 @@ export function layoutWallpaper(input: WallpaperInput): WallpaperLayout {
     },
   ];
 
-  return { width, height, theme: options.theme, tones, header, rule, rows, footer, empty };
+  return { width, height, theme: options.theme, tones, safe, header, rule, rows, footer, empty };
 }
 
 type Ctx = CanvasRenderingContext2D;
@@ -454,6 +573,20 @@ function paintRun(ctx: Ctx, run: TextRun) {
   ctx.textAlign = run.align;
   ctx.textBaseline = "alphabetic";
   ctx.fillText(run.text, run.x, run.y);
+}
+
+/**
+ * Canvas text is measured against whatever font the browser currently has, so
+ * every font must be resolved before the first draw or the wrap points are
+ * computed for the fallback face and land in the wrong place.
+ */
+export async function waitForFonts(): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts) return;
+  try {
+    await document.fonts.ready;
+  } catch {
+    /* fonts API unavailable: measurement falls back to the system face */
+  }
 }
 
 /** Paints a layout produced by `layoutWallpaper` onto a canvas context. */

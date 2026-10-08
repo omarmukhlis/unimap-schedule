@@ -2,13 +2,20 @@ import { describe, expect, it } from "vitest";
 import type { Session } from "./types";
 import {
   DEFAULT_WALLPAPER_OPTIONS,
+  MAX_CANVAS_AREA,
   PALETTE_IDS,
+  SAFE_BOTTOM_RATIO,
+  SAFE_SIDE_RATIO,
   SAFE_TOP_RATIO,
   WALLPAPER_PALETTES,
   WALLPAPER_PRESETS,
+  clampCanvasSize,
   clampDimension,
   getTones,
   layoutWallpaper,
+  resolveCanvasSize,
+  safeArea,
+  screenCanvasSize,
   MAX_DIMENSION,
   MIN_DIMENSION,
   type Measure,
@@ -36,7 +43,14 @@ function session(partial: Partial<Session>): Session {
 function build(sessions: Session[], overrides: Partial<WallpaperOptions> = {}) {
   return layoutWallpaper({
     sessions,
-    options: { ...DEFAULT_WALLPAPER_OPTIONS, ...overrides },
+    // Layout tests must not depend on the test machine's screen, so pin the size.
+    options: {
+      ...DEFAULT_WALLPAPER_OPTIONS,
+      sizeMode: "manual",
+      width: 1170,
+      height: 2532,
+      ...overrides,
+    },
     title: "UR6523002 - Y1G1 (25)",
     subtitle: "Bachelor of Computer Engineering with Honours",
     dayLabel: "Isnin",
@@ -52,18 +66,116 @@ const day: Session[] = [
 ];
 
 describe("presets", () => {
-  it("covers the requested phone sizes", () => {
+  it("covers every requested test size", () => {
     const sizes = WALLPAPER_PRESETS.map((preset) => `${preset.width}x${preset.height}`);
-    expect(sizes).toContain("1170x2532");
-    expect(sizes).toContain("1290x2796");
-    expect(sizes).toContain("1080x2400");
+    for (const expected of [
+      "1170x2532",
+      "1290x2796",
+      "1320x2868",
+      "1080x2400",
+      "1440x3120",
+      "750x1334",
+    ]) {
+      expect(sizes).toContain(expected);
+    }
   });
 
-  it("all fall inside the allowed dimension range", () => {
+  it("is labelled by size rather than by device model", () => {
+    for (const preset of WALLPAPER_PRESETS) {
+      expect(preset.label).toBe(`${preset.width} × ${preset.height}`);
+      expect(preset.label).not.toMatch(/iphone|android|galaxy|pixel/i);
+    }
+  });
+
+  it("all fall inside the allowed dimension range and area cap", () => {
     for (const preset of WALLPAPER_PRESETS) {
       expect(preset.width).toBeGreaterThanOrEqual(MIN_DIMENSION);
       expect(preset.height).toBeLessThanOrEqual(MAX_DIMENSION);
+      expect(preset.width * preset.height).toBeLessThanOrEqual(MAX_CANVAS_AREA);
     }
+  });
+});
+
+describe("safeArea", () => {
+  it("reserves the documented proportions", () => {
+    const safe = safeArea(1000, 2000);
+    expect(safe.x).toBe(70);
+    expect(safe.y).toBe(600);
+    expect(safe.width).toBe(860);
+    // 2000 - 30% top - 10% bottom
+    expect(safe.height).toBe(1200);
+  });
+
+  it("always leaves the two reserved bands empty", () => {
+    for (const preset of WALLPAPER_PRESETS) {
+      const safe = safeArea(preset.width, preset.height);
+      expect(safe.y).toBeGreaterThanOrEqual(preset.height * SAFE_TOP_RATIO - 1);
+      expect(preset.height - safe.y - safe.height).toBeGreaterThanOrEqual(
+        preset.height * SAFE_BOTTOM_RATIO - 1,
+      );
+      expect(safe.x).toBeGreaterThanOrEqual(preset.width * SAFE_SIDE_RATIO - 1);
+    }
+  });
+});
+
+describe("clampCanvasSize", () => {
+  it("leaves a size that already fits untouched", () => {
+    expect(clampCanvasSize(1170, 2532)).toEqual({ width: 1170, height: 2532 });
+  });
+
+  it("keeps total area under the canvas limit", () => {
+    const clamped = clampCanvasSize(4000, 4000);
+    expect(clamped.width * clamped.height).toBeLessThanOrEqual(MAX_CANVAS_AREA);
+  });
+
+  it("preserves the aspect ratio when scaling down", () => {
+    const source = { width: 3000, height: 6000 };
+    const clamped = clampCanvasSize(source.width, source.height);
+    const before = source.width / source.height;
+    const after = clamped.width / clamped.height;
+    expect(Math.abs(before - after)).toBeLessThan(0.05);
+  });
+
+  it("recovers from non-numeric input", () => {
+    expect(clampCanvasSize(Number.NaN, 2000).width).toBe(MIN_DIMENSION);
+  });
+});
+
+describe("screenCanvasSize", () => {
+  it("multiplies the screen by the pixel ratio", () => {
+    expect(screenCanvasSize(390, 844, 3)).toEqual({ width: 1170, height: 2532 });
+    expect(screenCanvasSize(360, 800, 3)).toEqual({ width: 1080, height: 2400 });
+  });
+
+  it("always returns portrait dimensions", () => {
+    const landscape = screenCanvasSize(844, 390, 3);
+    expect(landscape.width).toBeLessThan(landscape.height);
+  });
+
+  it("caps a huge screen area", () => {
+    const clamped = screenCanvasSize(2560, 1440, 4);
+    expect(clamped.width * clamped.height).toBeLessThanOrEqual(MAX_CANVAS_AREA);
+  });
+
+  it("treats a missing or invalid pixel ratio as 1", () => {
+    expect(screenCanvasSize(1170, 2532, 0)).toEqual({ width: 1170, height: 2532 });
+    expect(screenCanvasSize(1170, 2532, Number.NaN)).toEqual({ width: 1170, height: 2532 });
+  });
+});
+
+describe("resolveCanvasSize", () => {
+  it("uses the stored size in manual mode", () => {
+    expect(resolveCanvasSize({ ...DEFAULT_WALLPAPER_OPTIONS, sizeMode: "manual", width: 1080, height: 2400 })).toEqual({
+      width: 1080,
+      height: 2400,
+    });
+  });
+
+  it("clamps a manual size that is out of range", () => {
+    expect(resolveCanvasSize({ ...DEFAULT_WALLPAPER_OPTIONS, sizeMode: "manual", width: 10, height: 99_999 })).toEqual({
+      width: MIN_DIMENSION,
+      height: MAX_DIMENSION,
+    });
   });
 });
 
@@ -108,12 +220,63 @@ describe("clampDimension", () => {
 });
 
 describe("layoutWallpaper", () => {
-  it("keeps the header below the lock screen safe area", () => {
+  it("keeps the header below the reserved top band", () => {
     for (const preset of WALLPAPER_PRESETS) {
       const layout = build(day, { width: preset.width, height: preset.height });
-      const safeTop = Math.round(preset.height * SAFE_TOP_RATIO);
-      const firstBaseline = layout.header[0].y;
-      expect(safeTop).toBeLessThan(firstBaseline);
+      expect(layout.header[0].y).toBeGreaterThan(layout.safe.y);
+    }
+  });
+
+  it("keeps every row inside the safe area at every size", () => {
+    for (const preset of WALLPAPER_PRESETS) {
+      const layout = build(day, { width: preset.width, height: preset.height });
+      for (const row of layout.rows) {
+        expect(row.top).toBeGreaterThanOrEqual(layout.safe.y);
+        expect(row.top + row.height).toBeLessThanOrEqual(layout.safe.y + layout.safe.height);
+        expect(row.surface.x).toBeGreaterThanOrEqual(layout.safe.x);
+        expect(row.surface.x + row.surface.width).toBeLessThanOrEqual(
+          layout.safe.x + layout.safe.width,
+        );
+      }
+    }
+  });
+
+  it("keeps the footer out of the reserved bottom band", () => {
+    for (const preset of WALLPAPER_PRESETS) {
+      const layout = build(day, { width: preset.width, height: preset.height });
+      const safeBottom = layout.safe.y + layout.safe.height;
+      for (const run of layout.footer) {
+        expect(run.y).toBeLessThanOrEqual(safeBottom);
+        expect(safeBottom).toBeLessThan(preset.height);
+      }
+    }
+  });
+
+  it("stays inside the canvas even with a crowded day", () => {
+    const crowded = Array.from({ length: 14 }, (_, index) =>
+      session({ start: "08:00", end: "08:45", courseName: `SUBJECT ${index}` }),
+    );
+    for (const preset of WALLPAPER_PRESETS) {
+      const layout = build(crowded, { width: preset.width, height: preset.height });
+      const last = layout.rows[layout.rows.length - 1];
+      expect(last.top + last.height).toBeLessThanOrEqual(layout.safe.y + layout.safe.height);
+    }
+  });
+
+  it("ellipsizes a long venue instead of overflowing", () => {
+    const longVenue = session({ venue: "PAUH PUTRA - KOMPLEKS DEWAN KULIAH TAHANAN A (2000)" });
+    for (const preset of WALLPAPER_PRESETS) {
+      const layout = build([longVenue], { width: preset.width, height: preset.height });
+      const detail = layout.rows[0].lines.filter((run) =>
+        run.text.includes("KOMPLEKS") || run.text.includes("…"),
+      );
+      expect(detail.length).toBeGreaterThan(0);
+      for (const run of detail) {
+        expect(run.text.endsWith("…")).toBe(true);
+        expect(measure(run.text, run.size, run.weight)).toBeLessThanOrEqual(
+          layout.rows[0].surface.x + layout.rows[0].surface.width - run.x,
+        );
+      }
     }
   });
 

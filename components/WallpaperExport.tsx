@@ -4,13 +4,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@/lib/types";
 import {
   DEFAULT_WALLPAPER_OPTIONS,
+  MAX_CANVAS_AREA,
+  MAX_DIMENSION,
+  MIN_DIMENSION,
   PALETTE_IDS,
+  SAFE_BOTTOM_RATIO,
+  SAFE_SIDE_RATIO,
+  SAFE_TOP_RATIO,
   WALLPAPER_FONT,
   WALLPAPER_PALETTES,
   WALLPAPER_PRESETS,
-  clampDimension,
+  clampCanvasSize,
+  currentScreenCanvasSize,
   drawWallpaper,
   layoutWallpaper,
+  waitForFonts,
   type Measure,
   type WallpaperOptions,
   type WallpaperTheme,
@@ -60,9 +68,15 @@ function isPaletteId(value: unknown): value is WallpaperOptions["palette"] {
 
 function sanitizeOptions(value: unknown): WallpaperOptions {
   const input = (value ?? {}) as Partial<WallpaperOptions>;
+  const sizeMode = input.sizeMode === "manual" ? "manual" : "screen";
+  // In screen mode the stored numbers are only a cached snapshot of the device
+  // size, so an unusable one falls back to the preset rather than the minimum.
+  const size = sizeMode === "manual" ? clampCanvasSize(Number(input.width), Number(input.height)) : null;
+
   return {
-    width: clampDimension(Number(input.width) || DEFAULT_WALLPAPER_OPTIONS.width),
-    height: clampDimension(Number(input.height) || DEFAULT_WALLPAPER_OPTIONS.height),
+    sizeMode,
+    width: size?.width ?? DEFAULT_WALLPAPER_OPTIONS.width,
+    height: size?.height ?? DEFAULT_WALLPAPER_OPTIONS.height,
     theme: input.theme === "dark" ? "dark" : "light",
     palette: isPaletteId(input.palette) ? input.palette : DEFAULT_WALLPAPER_OPTIONS.palette,
     showLecturers: input.showLecturers !== false,
@@ -112,10 +126,14 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
   const [day, setDay] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [showSafeZones, setShowSafeZones] = useState(false);
+  const [screenSize, setScreenSize] = useState(() => currentScreenCanvasSize());
   const previewRef = useRef<HTMLCanvasElement | null>(null);
   const renderedRef = useRef<HTMLCanvasElement | null>(null);
+  const [previewSize, setPreviewSize] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
+    setScreenSize(currentScreenCanvasSize());
     try {
       const stored = window.localStorage.getItem(OPTIONS_KEY);
       if (stored) setOptions(sanitizeOptions(JSON.parse(stored)));
@@ -145,6 +163,21 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
     }
   }, [options, hydrated]);
 
+  // Rotating the phone or moving it to another display changes the pixel grid,
+  // so screen mode has to be re-measured rather than frozen at mount.
+  useEffect(() => {
+    if (!hydrated || options.sizeMode !== "screen") return;
+    const remeasure = () => setScreenSize(currentScreenCanvasSize());
+    window.addEventListener("resize", remeasure);
+    window.addEventListener("orientationchange", remeasure);
+    screen.orientation?.addEventListener?.("change", remeasure);
+    return () => {
+      window.removeEventListener("resize", remeasure);
+      window.removeEventListener("orientationchange", remeasure);
+      screen.orientation?.removeEventListener?.("change", remeasure);
+    };
+  }, [hydrated, options.sizeMode]);
+
   const days = useMemo(() => activeDays(sessions), [sessions]);
 
   const activeDay = day && days.includes(day) ? day : (days[0] ?? "");
@@ -158,36 +191,60 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
     setNotice(null);
   }, []);
 
+  const applyScreenSize = useCallback(() => {
+    const size = currentScreenCanvasSize();
+    setScreenSize(size);
+    setOptions((previous) => ({ ...previous, sizeMode: "screen", ...size }));
+  }, []);
+
+  const applyPresetSize = useCallback((width: number, height: number) => {
+    setOptions((previous) => ({ ...previous, sizeMode: "manual", width, height }));
+  }, []);
+
   // Repaint the preview whenever anything that affects the image changes.
   useEffect(() => {
     const preview = previewRef.current;
     if (!preview || typeof document === "undefined") return;
 
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    let cancelled = false;
 
-    const layout = layoutWallpaper({
-      sessions: daySessions,
-      options,
-      title: groupLabel,
-      subtitle: programName,
-      dayLabel: WEEKDAY_LABEL[activeDay] ?? activeDay,
-      dateLabel: dateOfDay(activeDay) ?? "",
-      measure: makeMeasure(),
-    });
+    const paint = async () => {
+      // Wrapping is measured against the loaded font, so wait for it first.
+      await waitForFonts();
+      if (cancelled) return;
 
-    canvas.width = layout.width;
-    canvas.height = layout.height;
-    drawWallpaper(ctx, layout);
-    renderedRef.current = canvas;
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
+      if (!ctx || cancelled) return;
 
-    preview.width = PREVIEW_WIDTH;
-    preview.height = Math.round((PREVIEW_WIDTH * layout.height) / layout.width);
-    const previewCtx = preview.getContext("2d");
-    if (!previewCtx) return;
-    previewCtx.clearRect(0, 0, preview.width, preview.height);
-    previewCtx.drawImage(canvas, 0, 0, preview.width, preview.height);
+      const layout = layoutWallpaper({
+        sessions: daySessions,
+        options,
+        title: groupLabel,
+        subtitle: programName,
+        dayLabel: WEEKDAY_LABEL[activeDay] ?? activeDay,
+        dateLabel: dateOfDay(activeDay) ?? "",
+        measure: makeMeasure(),
+      });
+
+      canvas.width = layout.width;
+      canvas.height = layout.height;
+      drawWallpaper(ctx, layout);
+      renderedRef.current = canvas;
+      setPreviewSize({ width: layout.width, height: layout.height });
+
+      preview.width = PREVIEW_WIDTH;
+      preview.height = Math.round((PREVIEW_WIDTH * layout.height) / layout.width);
+      const previewCtx = preview.getContext("2d");
+      if (!previewCtx) return;
+      previewCtx.clearRect(0, 0, preview.width, preview.height);
+      previewCtx.drawImage(canvas, 0, 0, preview.width, preview.height);
+    };
+
+    void paint();
+    return () => {
+      cancelled = true;
+    };
   }, [daySessions, options, groupLabel, programName, activeDay]);
 
   const handleExport = useCallback(async () => {
@@ -202,8 +259,9 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
     const tab = needsTab ? window.open("", "_blank") : null;
 
     try {
+      await waitForFonts();
       const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
-      if (!blob) throw new Error("canvas returned no data");
+      if (!blob || blob.size === 0) throw new Error("canvas returned no data");
 
       const filename = `jadual-${slug(groupLabel)}-${slug(WEEKDAY_LABEL[activeDay] ?? activeDay)}.png`;
       const file = new File([blob], filename, { type: "image/png" });
@@ -247,13 +305,26 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
     }
   }, [canShareFiles, groupLabel, activeDay]);
 
-  const ratio = `${options.width} × ${options.height}`;
+  const isScreenSize = options.sizeMode === "screen";
+  const ratio = isScreenSize
+    ? `${screenSize.width} × ${screenSize.height}`
+    : `${options.width} × ${options.height}`;
+  const safeBox =
+    previewSize.width > 0
+      ? {
+          top: `${SAFE_TOP_RATIO * 100}%`,
+          bottom: `${SAFE_BOTTOM_RATIO * 100}%`,
+          left: `${SAFE_SIDE_RATIO * 100}%`,
+          right: `${SAFE_SIDE_RATIO * 100}%`,
+        }
+      : null;
 
   return (
     <section className="rounded-2xl border border-slate-200 bg-white p-4">
       <h2 className="text-base font-semibold">Wallpaper jadual</h2>
       <p className="mt-1 text-sm text-slate-500">
-        Jana sendiri dalam pelayar. Ruang atas dikosongkan untuk jam skrin kunci.
+        Jana sendiri dalam pelayar. Ruang atas dan bawah dikosongkan untuk jam serta ikon skrin
+        kunci.
       </p>
 
       {days.length === 0 ? (
@@ -280,11 +351,58 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
           </div>
 
           <div className="mt-4 flex gap-4">
-            <canvas
-              ref={previewRef}
-              className="w-full max-w-[13rem] shrink-0 rounded-xl shadow-sm"
-              aria-label="Pratonton wallpaper"
-            />
+            {/* Phone frame: the wallpaper is drawn inside it exactly as it will
+                be saved, so the shaded bands line up with the real safe area. */}
+            <div className="w-full max-w-[13rem] shrink-0">
+              <div className="relative overflow-hidden rounded-[1.75rem] bg-slate-900 p-1.5 shadow-sm ring-1 ring-slate-300">
+                <div className="relative overflow-hidden rounded-[1.4rem]">
+                  <canvas
+                    ref={previewRef}
+                    className="block w-full"
+                    aria-label="Pratonton wallpaper"
+                  />
+
+                  {showSafeZones && safeBox && (
+                    <>
+                      <div
+                        className="pointer-events-none absolute inset-x-0 top-0 bg-amber-400/35"
+                        style={{ height: safeBox.top }}
+                        aria-hidden
+                      />
+                      <div
+                        className="pointer-events-none absolute inset-x-0 bottom-0 bg-amber-400/35"
+                        style={{ height: safeBox.bottom }}
+                        aria-hidden
+                      />
+                      <div
+                        className="pointer-events-none absolute inset-y-0 left-0 bg-amber-400/35"
+                        style={{ width: safeBox.left }}
+                        aria-hidden
+                      />
+                      <div
+                        className="pointer-events-none absolute inset-y-0 right-0 bg-amber-400/35"
+                        style={{ width: safeBox.right }}
+                        aria-hidden
+                      />
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setShowSafeZones((value) => !value)}
+                aria-pressed={showSafeZones}
+                className="mt-2 w-full rounded-lg bg-slate-50 px-2 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
+              >
+                {showSafeZones ? "Sembunyikan zon selamat" : "Tunjuk zon selamat"}
+              </button>
+              <p className="mt-1 text-center text-[11px] leading-snug text-slate-400">
+                {SAFE_TOP_RATIO * 100}% atas, {SAFE_BOTTOM_RATIO * 100}% bawah,{" "}
+                {SAFE_SIDE_RATIO * 100}% sisi dikosongkan
+              </p>
+            </div>
+
             <div className="min-w-0 flex-1 space-y-2">
               <Toggle
                 label="Tunjuk pensyarah"
@@ -344,15 +462,36 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
 
           <div className="mt-4 space-y-3">
             <div>
-              <p className="text-xs text-slate-500">Saiz</p>
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs text-slate-500">Saiz</p>
+                <button
+                  type="button"
+                  onClick={
+                    isScreenSize
+                      ? () => applyPresetSize(screenSize.width, screenSize.height)
+                      : applyScreenSize
+                  }
+                  className={`rounded-lg px-2.5 py-1 text-xs font-medium ${
+                    isScreenSize
+                      ? "bg-sky-600 text-white"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  }`}
+                >
+                  {isScreenSize ? "Skrin ini" : "Saiz tetap"}
+                </button>
+              </div>
+
               <div className="mt-1 flex flex-wrap gap-1.5">
                 {WALLPAPER_PRESETS.map((preset) => {
-                  const active = options.width === preset.width && options.height === preset.height;
+                  const active =
+                    options.sizeMode === "manual" &&
+                    options.width === preset.width &&
+                    options.height === preset.height;
                   return (
                     <button
                       key={preset.id}
                       type="button"
-                      onClick={() => update({ width: preset.width, height: preset.height })}
+                      onClick={() => applyPresetSize(preset.width, preset.height)}
                       className={`rounded-lg px-2.5 py-1 text-xs font-medium ${
                         active
                           ? "bg-slate-900 text-white"
@@ -372,11 +511,15 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
                 <input
                   type="number"
                   inputMode="numeric"
-                  min={480}
-                  max={4000}
-                  value={options.width}
-                  onChange={(event) => update({ width: clampDimension(Number(event.target.value)) })}
-                  className="mt-1 w-full rounded-lg bg-slate-50 px-2 py-1.5 text-sm tabular-nums"
+                  min={MIN_DIMENSION}
+                  max={MAX_DIMENSION}
+                  value={isScreenSize ? screenSize.width : options.width}
+                  onChange={(event) => {
+                    const size = clampCanvasSize(Number(event.target.value), options.height);
+                    applyPresetSize(size.width, size.height);
+                  }}
+                  className="mt-1 w-full rounded-lg bg-slate-50 px-2 py-1.5 text-sm tabular-nums disabled:opacity-60"
+                  disabled={isScreenSize}
                 />
               </label>
               <label className="flex-1">
@@ -384,15 +527,25 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
                 <input
                   type="number"
                   inputMode="numeric"
-                  min={480}
-                  max={4000}
-                  value={options.height}
-                  onChange={(event) => update({ height: clampDimension(Number(event.target.value)) })}
-                  className="mt-1 w-full rounded-lg bg-slate-50 px-2 py-1.5 text-sm tabular-nums"
+                  min={MIN_DIMENSION}
+                  max={MAX_DIMENSION}
+                  value={isScreenSize ? screenSize.height : options.height}
+                  onChange={(event) => {
+                    const size = clampCanvasSize(options.width, Number(event.target.value));
+                    applyPresetSize(size.width, size.height);
+                  }}
+                  className="mt-1 w-full rounded-lg bg-slate-50 px-2 py-1.5 text-sm tabular-nums disabled:opacity-60"
+                  disabled={isScreenSize}
                 />
               </label>
               <p className="pb-2 text-xs tabular-nums text-slate-400">{ratio}</p>
             </div>
+
+            <p className="text-xs text-slate-400">
+              {isScreenSize
+                ? `Ikut skrin ini (${screenSize.width} × ${screenSize.height}). Had kanvas ${(MAX_CANVAS_AREA / 1_000_000).toFixed(0)} juta piksel.`
+                : `Saiz tetap. Had kanvas ${(MAX_CANVAS_AREA / 1_000_000).toFixed(0)} juta piksel.`}
+            </p>
           </div>
 
           <button
@@ -404,9 +557,11 @@ export default function WallpaperExport({ groupLabel, programName, sessions }: P
             {busy ? "Menjana…" : "Muat turun wallpaper"}
           </button>
 
-          {notice && <p className="mt-2 text-xs text-slate-500">{notice}</p>}
+          <p className="mt-2 text-xs text-slate-500">Paling sesuai untuk lock screen</p>
+
+          {notice && <p className="mt-1 text-xs text-slate-500">{notice}</p>}
           {!canShareFiles && (
-            <p className="mt-2 text-xs text-slate-400">
+            <p className="mt-1 text-xs text-slate-400">
               Pelayar ini tidak sokong perkongsian fail, jadi imej akan dibuka atau disimpan terus.
             </p>
           )}
